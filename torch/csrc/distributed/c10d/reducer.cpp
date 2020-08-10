@@ -300,7 +300,7 @@ void Reducer::verify_replica0_across_processes() {
   }
 }
 
-void Reducer::mark_variable_ready_dense(VariableIndex index) {
+void Reducer::mark_variable_ready_dense(VariableIndex index, int divFactor) {
   const auto replica_index = index.replica_index;
   const auto variable_index = index.variable_index;
   const auto& bucket_index = variable_locators_[variable_index];
@@ -352,8 +352,7 @@ void Reducer::mark_variable_ready_dense(VariableIndex index) {
             bucket_view.strides());
       }
       // imitates wrapped_scalar_tensor in ATen/native/BinaryOps.cpp
-      auto wrapped =
-          c10::scalar_to_tensor(double(1.) / process_group_->getSize());
+      auto wrapped = c10::scalar_to_tensor(double(1.) / divFactor);
       wrapped.unsafeGetTensorImpl()->set_wrapped_number(true);
       // Divides while copying into the bucket view.
       at::native::mul_out(bucket_view, grad, wrapped);
@@ -365,7 +364,7 @@ void Reducer::mark_variable_ready_dense(VariableIndex index) {
   });
 }
 
-void Reducer::mark_variable_ready_sparse(VariableIndex index) {
+void Reducer::mark_variable_ready_sparse(VariableIndex index, int divFactor) {
   const auto replica_index = index.replica_index;
   const auto variable_index = index.variable_index;
   const auto& bucket_index = variable_locators_[variable_index];
@@ -385,10 +384,84 @@ void Reducer::mark_variable_ready_sparse(VariableIndex index) {
     // struct are empty, and there is no pre-existing accumulation tensor.
     // Directly assign the sparse tensor to the `contents` field.
     replica.contents = grad;
-    replica.contents.div_(process_group_->getSize());
+    replica.contents.div_(divFactor);
     // The grad is modified in place and needs to be written back.
     return true;
   });
+}
+
+size_t Reducer::getNumBuckets() const {
+  return buckets_.size();
+}
+
+std::vector<at::Tensor> Reducer::getTensorsForBucket(int i) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  TORCH_CHECK(
+      i < buckets_.size(),
+      c10::str(
+          "Attempt to access bucket index ",
+          i,
+          " but only have ",
+          buckets_.size(),
+          " buckets."))
+  auto& bucket = buckets_[i];
+  std::vector<at::Tensor> tensors;
+  tensors.reserve(bucket.replicas.size());
+  for (const auto& rep : bucket.replicas) {
+    tensors.push_back(rep.contents);
+  }
+  return tensors;
+}
+
+bool Reducer::shouldRebuildBuckets() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // if find_unused_parameters_, we do not rebuild buckets.
+  return !find_unused_parameters_ && !has_rebuilt_bucket_;
+}
+
+void Reducer::setForwardPassWorkHandle(
+    std::shared_ptr<c10d::ProcessGroup::Work> forwardPassWorkHandle,
+    at::Tensor& tensor) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // If there was a previous handle, it should have already completed. This is
+  // because we await this handle in the backward pass, and only reinstall in
+  // the next forward pass.
+  if (forwardPassWorkHandle_.workHandle_) {
+    TORCH_INTERNAL_ASSERT(forwardPassWorkHandle_.workHandle_->isCompleted());
+  }
+  forwardPassWorkHandle_.workHandle_ = std::move(forwardPassWorkHandle);
+  forwardPassWorkHandle_.resultTensor_ = tensor;
+}
+
+std::vector<at::Tensor> Reducer::getLocalUsedMapsOnDevice() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return local_used_maps_dev_;
+}
+
+void Reducer::pushRebuiltParamsForAllIndices() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto replica_count = replicas_.size();
+  for (size_t replica_index = 0; replica_index < replica_count;
+       ++replica_index) {
+    const auto variable_count = replicas_[replica_index].size();
+    for (size_t variable_index = 0; variable_index < variable_count;
+         ++variable_index) {
+      const auto index = VariableIndex{
+          .replica_index = replica_index,
+          .variable_index = variable_index,
+      };
+      pushRebuiltParams(index);
+    }
+  }
+}
+
+void Reducer::pushRebuiltParams(const VariableIndex& index) {
+  if (!has_rebuilt_bucket_ && !find_unused_parameters_ &&
+      index.replica_index == 0) {
+    rebuilt_params_.push_back(
+        replicas_[index.replica_index][index.variable_index]);
+    rebuilt_param_indices_.push_back(index.variable_index);
+  }
 }
 
 // The function `autograd_hook` is called after the gradient for a
@@ -422,12 +495,7 @@ void Reducer::autograd_hook(VariableIndex index) {
   // rebuilt_params_ and rebuilt_param_indices_, and then will be broadcasted
   // and intialized. Also we only need to dump tensors and parameter indcies of
   // one replica.
-  if (!has_rebuilt_bucket_ && !find_unused_parameters_ &&
-      index.replica_index == 0) {
-    rebuilt_params_.push_back(
-        replicas_[index.replica_index][index.variable_index]);
-    rebuilt_param_indices_.push_back(index.variable_index);
-  }
+  pushRebuiltParams(index);
 
   // If `find_unused_parameters_` is true there may be model parameters that
   // went unused when computing the model output, they won't be part of the
@@ -498,10 +566,22 @@ void Reducer::mark_variable_ready(VariableIndex index) {
     TORCH_CHECK(!has_marked_unused_parameters_, common_error);
   }
 
-  if (bucket.expect_sparse_gradient) {
-    mark_variable_ready_sparse(index);
+  // If it was scheduled, wait on allreduce in forward pass that tells us
+  // division factor based on no. of currently participating processes.
+  int divFactor;
+  auto& workHandle = forwardPassWorkHandle_.workHandle_;
+  if (workHandle) {
+    workHandle->wait();
+    at::Tensor& res = forwardPassWorkHandle_.resultTensor_;
+    divFactor = res.item().to<int>();
   } else {
-    mark_variable_ready_dense(index);
+    divFactor = process_group_->getSize();
+  }
+
+  if (bucket.expect_sparse_gradient) {
+    mark_variable_ready_sparse(index, divFactor);
+  } else {
+    mark_variable_ready_dense(index, divFactor);
   }
 
   // TODO(@pietern): Make this work for both CPU/CUDA tensors.
@@ -545,11 +625,14 @@ void Reducer::mark_variable_ready(VariableIndex index) {
       c10::OptionalStreamGuard currentStreamGuard{currentStream};
       this->finalize_backward();
       // Rebuild bucket if this is the first time to rebuild
-      if (!rebuilt_params_.empty()) {
+      if (!has_rebuilt_bucket_ && !find_unused_parameters_) {
+        TORCH_CHECK(!rebuilt_params_.empty());
+        // Unlock before rebuildBuckets() since both rebuildBuckets() and
+        // initialize_buckets() grab the lock.
+        lock.unlock();
         auto rebuilt_bucket_indices = rebuildBuckets();
         // Unlock before initialize_buckets() as initialize_buckets() requires a
         // lock, it could result in self deadlock without unlocking here.
-        lock.unlock();
         initialize_buckets(std::move(rebuilt_bucket_indices));
       } else {
         lock.unlock();
@@ -1100,12 +1183,23 @@ void Reducer::sync_bucket_indices(
 }
 
 std::vector<std::vector<size_t>> Reducer::rebuildBuckets() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  TORCH_INTERNAL_ASSERT(
+      !has_rebuilt_bucket_, "Expected to rebuild buckets at most once.");
   TORCH_INTERNAL_ASSERT(
       rebuilt_params_.size() == rebuilt_param_indices_.size(),
-      "rebuilt parameter tensors size is not same as rebuilt parameter indices size.");
+      c10::str(
+          "rebuilt parameter tensors size is not same as rebuilt parameter indices size: ",
+          rebuilt_params_.size(),
+          " versus ",
+          rebuilt_param_indices_.size()));
   TORCH_INTERNAL_ASSERT(
       replicas_[0].size() == rebuilt_param_indices_.size(),
-      "rebuilt parameter indices size is not same as original model parameters size.");
+      c10::str(
+          "rebuilt parameter indices size is not same as original model parameters size.",
+          replicas_[0].size(),
+          " versus ",
+          rebuilt_param_indices_.size()));
   std::vector<std::vector<size_t>> rebuilt_bucket_indices;
   std::vector<size_t> bucket_size_limits;
   bucket_size_limits.push_back(kDefaultFirstBucketBytes);
