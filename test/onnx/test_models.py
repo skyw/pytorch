@@ -195,7 +195,8 @@ class TestModels(TestCase):
         x = Variable(torch.randn(BATCH_SIZE, 3, 224, 224).fill_(1.0))
         qat_resnet50 = resnet50()
 
-        qat_resnet50.qconfig = quantization.default_qat_qconfig
+        qat_resnet50.qconfig = quantization.QConfig(
+            activation=quantization.default_fake_quant, weight=quantization.default_per_channel_weight_fake_quant)
         quantization.prepare_qat(qat_resnet50, inplace=True)
         qat_resnet50.apply(torch.quantization.enable_observer)
         qat_resnet50.apply(torch.quantization.enable_fake_quant)
