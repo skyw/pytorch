@@ -1,9 +1,5 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
-import torch
-import torch.onnx.symbolic_helper as sym_help
-from torch.onnx.symbolic_helper import parse_args, _parse_arg
-
 @parse_args('v', 'v', 'v', 'i', 'i', 'i')
 def fake_quantize_per_channel_affine(g, inputs, scale, zero_point, axis, quant_min=-128, quant_max=127):
     if quant_min not in [0, -128] or quant_max not in [127, 255]:
