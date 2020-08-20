@@ -165,13 +165,13 @@ class TestModels(TestCase):
 
     @skipIfUnsupportedMinOpsetVersion(10)
     def test_fake_quant(self):
-        x = Variable(torch.randn(BATCH_SIZE, 3, 224, 224).fill_(1.0))
+        x = torch.randn(BATCH_SIZE, 3, 224, 224).fill_(1.0)
         self.exportTest(toC(FakeQuantNet()), toC(x))
 
     @skipIfUnsupportedMinOpsetVersion(10)
     def test_qat_resnet_per_tensor(self):
         # Quantize ResNet50 model
-        x = Variable(torch.randn(BATCH_SIZE, 3, 224, 224).fill_(1.0))
+        x = torch.randn(BATCH_SIZE, 3, 224, 224).fill_(1.0)
         qat_resnet50 = resnet50()
 
         # Use per tensor for weight. Per channel support will come with opset 13
