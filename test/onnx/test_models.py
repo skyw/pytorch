@@ -192,7 +192,7 @@ class TestModels(TestCase):
     @skipIfUnsupportedMinOpsetVersion(13)
     def test_qat_resnet_per_channel(self):
         # Quantize ResNet50 model
-        x = Variable(torch.randn(BATCH_SIZE, 3, 224, 224).fill_(1.0))
+        x = torch.randn(BATCH_SIZE, 3, 224, 224).fill_(1.0)
         qat_resnet50 = resnet50()
 
         qat_resnet50.qconfig = quantization.QConfig(
